@@ -1,0 +1,277 @@
+---
+title: "Repository Watch"
+author: "Emil Hvitfeldt"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+params:
+   github_token: !r gh::gh_token()
+---
+
+
+```{css}
+.tag {
+  display: inline-block;
+  padding: 2px 12px;
+  border-radius: 10px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.status-passing {
+  background: hsl(116, 60%, 90%);
+  color: hsl(116, 30%, 25%);
+}
+
+.status-missing {
+  background: hsl(230, 70%, 90%);
+  color: hsl(230, 45%, 30%);
+}
+
+.status-failing {
+  background: hsl(350, 70%, 90%);
+  color: hsl(350, 45%, 30%);
+}
+
+
+.status-yes {
+  background: hsl(116, 60%, 90%);
+  color: hsl(116, 30%, 25%);
+}
+
+.status-no {
+  background: hsl(350, 70%, 90%);
+  color: hsl(350, 45%, 30%);
+}
+```
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(reactable)
+library(tidyverse)
+library(ymlthis)
+library(httr)
+library(glue)
+library(gh)
+```
+
+```{r}
+usc <- "USCbiostats"
+
+repos <- tribble(
+  ~owner,         ~name,               ~org,
+  usc,            "aphylo",            TRUE,
+  usc,            "bayesnetworks",     TRUE,
+  usc,            "BinaryDosage",      TRUE,
+  usc,            "causnet",           TRUE,
+  usc,            "fdrci",             TRUE,
+  usc,            "fmcmc",             TRUE,
+  usc,            "GxEScanR",          TRUE,
+  usc,            "HiLDA",             TRUE,
+  "lailylajiang", "hJAM",              FALSE,
+  usc,            "jsPhyloSVG",        TRUE,
+  usc,            "LUCIDus",           TRUE,
+  usc,            "partition",         TRUE,
+  usc,            "polygons",          TRUE,
+  usc,            "rphyloxml",         TRUE,
+  #usc,            "selectKSigs",       TRUE, # Need a readme
+  usc,            "slurmR",            TRUE,
+  usc,            "xrnet",             TRUE,
+  "ChubingZeng",  "xtune",             FALSE
+)
+```
+
+```{r}
+r_cmd_check_svg <- function(x) {
+  if (x$total_count == 0) {
+    return(NA)
+  }
+  
+  workflow_names <- map_chr(x$workflows,  "name")
+  
+  if(!any(workflow_names == "R-CMD-check")) {
+    return(NA)
+  }
+  
+  x$workflows[workflow_names == "R-CMD-check"][[1]]$badge_url
+}
+
+r_cmd_check_svg_to_text <- function(x) {
+  if (is.na(x)) {
+      return("missing")
+  }
+      
+  read_lines(x) %>%
+    str_detect("passing") %>%
+    any() %>%
+    if_else("passing", "failing")
+}
+```
+
+```{r}
+r_cmd_check_versions <- function(x) {
+  if (x$total_count == 0) {
+    return("")
+  }
+  
+  workflow_names <- map_chr(x$workflows,  "name")
+  
+  if(!any(workflow_names == "R-CMD-check")) {
+    return("")
+  }
+  
+  yaml <- x$workflows[workflow_names == "R-CMD-check"][[1]]$html_url %>%
+    str_replace("https://github.com/", "https://raw.githubusercontent.com/") %>%
+    str_remove("blob/") %>%
+    read_toml()
+  
+  map_chr(yaml$jobs$`R-CMD-check`$strategy$matrix$config, "r") %>%
+    sort() %>%
+    unique() %>%
+    paste(collapse = ", ")
+}
+```
+
+```{r}
+check_readme_bagdes <- function(x) {
+  all_lines <- read_lines(x$download_url)
+
+bagdes <- all_lines %>%
+  str_c(collapse = "") %>%
+  str_split("\\[!\\[") %>%
+  .[[1]] %>%
+  str_remove_all("\\].*")
+
+tibble(`bagde r_cmd_check` = "R buildstatus" %in% bagdes,
+       `bagde codecov` = any(str_detect(bagdes, "Codecov")),
+       `bagde cran_version` = "CRANstatus" %in% bagdes,
+       `bagde downloads` = any(str_detect(bagdes, "Downloads")),
+       `bagde lifecycle` = any(str_detect(bagdes, "Lifecycle")),
+       `bagde DOI` = "DOI" %in% bagdes
+       )
+}
+```
+
+```{r}
+logical_style <- function(value) {
+  value <- if_else(value, "yes", "no")
+      class <- paste0("tag status-", value)
+      htmltools::div(class = class, value)
+  }
+```
+
+```{r dependencies}
+get_dependences <- function(package) {
+  url <- POST(glue("https://tinyverse.netlify.com/badge/{package}"))$url
+  str_extract(url, "[0-9]+/[0-9]+")
+}
+```
+
+```{r}
+get_codecov_value <- function(owner, name) {
+  read_lines(glue("https://codecov.io/gh/{owner}/{name}/branch/master/graph/badge.svg")) %>%
+  str_trim() %>%
+  str_subset("^<text") %>%
+  str_subset("[0-9]+%") %>%
+  str_extract("[0-9]+%") %>%
+  .[1] %>%
+  parse_number()
+}
+
+safe_get_codecov_value <- function(owner, name) {
+  rrr <- map2(owner, name, safely(get_codecov_value))
+
+  if_else(map_lgl(rrr, ~ is.null(.$error)), map_chr(rrr, "result"), "timeout")
+}
+```
+
+```{r}
+get_grand_total <- function(package) {
+  read_lines(glue("https://cranlogs.r-pkg.org/downloads/total/2012-10-01:{Sys.Date()}/{package}")) %>%
+    str_extract('downloads\":[0-9]*') %>%
+    parse_number()
+}
+```
+
+```{r}
+get_last_month <- function(package) {
+  read_lines(glue("http://cranlogs.r-pkg.org/downloads/total/last-month/{package}")) %>%
+    str_extract('downloads\":[0-9]*') %>%
+    parse_number()
+}
+```
+
+```{r}
+metrix_table <- repos %>%
+  mutate(dependences = map_chr(name, get_dependences),
+        # codecov = map2_chr(owner, name, safe_get_codecov_value),
+         grand_total = map_dbl(name, get_grand_total),
+         last_month = map_dbl(name, get_last_month))
+```
+
+
+Repositories
+=======================================================================
+
+```{r}
+github_actions <- map2(repos$owner, repos$name, 
+                       ~ gh("GET /repos/:owner/:repo/actions/workflows", 
+                            owner = .x, repo = .y, .token = params$github_token))
+
+
+readme_bagde_status <- map2(repos$owner, repos$name,
+                       ~ gh("GET /repos/:owner/:repo/readme", 
+                            owner = .x, repo = .y, .token = params$github_token)) %>%
+  map_dfr(check_readme_bagdes)
+
+table_data <- repos %>%
+  mutate(`R CMD check` = map_chr(github_actions, r_cmd_check_svg),
+         `R CMD check` = map_chr(`R CMD check`, r_cmd_check_svg_to_text),
+         `Versions` = map_chr(github_actions, r_cmd_check_versions)) %>%
+  bind_cols(readme_bagde_status)
+```
+
+
+```{r}
+table_data %>%
+  select(-org, -owner) %>% 
+  reactable(
+    columns = list(
+    `R CMD check` = colDef(cell = function(value) {
+      class <- paste0("tag status-", value)
+      htmltools::div(class = class, value)
+  }),
+  `bagde codecov` = colDef(cell = logical_style, name = "CodeCov"),
+  `bagde r_cmd_check` = colDef(cell = logical_style, name = "C CMD check"),
+  `bagde cran_version` = colDef(cell = logical_style, name = "CRAN version"),
+  `bagde downloads` = colDef(cell = logical_style, name = "Downloads"),
+  `bagde lifecycle` = colDef(cell = logical_style, name = "Lifecycle"),
+  `bagde DOI` = colDef(cell = logical_style, name = "DOI"),
+  name = colDef(name = "Name")
+  ),
+  columnGroups = list(
+    colGroup(name = "Bagdes", columns = c("bagde r_cmd_check", "bagde codecov", "bagde cran_version", 
+"bagde downloads", "bagde lifecycle", "bagde DOI"))
+  )
+  )
+
+```
+
+Metrics
+=======================================================================
+
+```{r}
+metrix_table %>%
+  separate(dependences, sep = "/", into = c("Direct", "Recursive"), convert = TRUE) %>%
+  select(-org) %>%
+  reactable(
+    columns = list(
+      owner = colDef(name = "Owner"),
+      name = colDef(name = "Name")
+    ),
+    columnGroups = list(
+      colGroup(name = "Dependencies", columns = c("Direct", "Recursive")),
+      colGroup(name = "Downloads", columns = c("grand_total", "last_month"))
+    )
+  )
+```
